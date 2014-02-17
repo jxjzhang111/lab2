@@ -193,6 +193,7 @@ static int osprd_open(struct inode *inode, struct file *filp)
 // last copy is closed.)
 static int osprd_close_last(struct inode *inode, struct file *filp)
 {
+	if (DEBUG) eprintk ("Closing\n");
 	if (filp) {
 		osprd_info_t *d = file2osprd(filp);
 		int filp_writable = filp->f_mode & FMODE_WRITE;
@@ -237,7 +238,6 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
 		
 		osp_spin_unlock(&(d->mutex));
 		wake_up_all(&(d->blockq));
-
 	}
 
 	return 0;
@@ -350,15 +350,18 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 				
 				//I encountered a signal, return error condition
 				if (d->ticket_tail == ticket) {
+					if (DEBUG) eprintk ("Granting to next live process\n");
 					grantTicketToNextAliveProcessInOrder(d); //Tuan define this
 				}
 				else  {  //mark my ticket as not usable before process exits
+					if (DEBUG) eprintk ("Adding to exited tickets\n");
 					addToTicketList(&(d->exitedTickets), ticket);
 					//TUAN: this is important because when other process grants the ticket
 					//It makes sure it not grant the ticket to processes that already exited.
 					//It do that by incrementing ticket_tail and make sure ticket_tail not
 					//match the already exited ticket.
 				}
+				if (DEBUG) eprintk ("Returning ERESTARTSYS\n");
 				return -ERESTARTSYS; //TUAN: means your system call is restartable. The process is considered exited/died.
 			}
 			
@@ -489,14 +492,9 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 			
 			osp_spin_unlock(&(d->mutex));
 			
-			/*
-			 wait_event_interruptible. The first argument is the wait queue. The second argument is the condition to wake up.
-			 The process wakes up when the condition is true or a signal is received.
-			 The function returns 0 if the condition is true. Return -ERESTARTSYS if a signal is received.
-			 */
-			
 			//block until all conditions are met
 			if (d->writeLockingPids != NULL || d->readLockingPids != NULL) {
+				if (DEBUG) eprintk ("Failed to try acquire write lock\n");
 				return -EBUSY;
 			}
 			
@@ -551,8 +549,10 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 			osp_spin_unlock(&(d->mutex));
 			
 			//block until all conditions are met
-			if (d->writeLockingPids != NULL)
+			if (d->writeLockingPids != NULL) {
+				if (DEBUG) eprintk ("Failed to try acquire read lock\n");
 				return -EBUSY;
+			}
 			
 			// Acquire lock
 			osp_spin_lock(&(d->mutex));
@@ -580,6 +580,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// you need, and return 0.
 
 		// Your code here (instead of the next line).
+		if (DEBUG) eprintk("Release\n");
 		osp_spin_lock(&(d->mutex));
 		
 		//TUAN: If the file hasn't locked the ramdisk, return -EINVAL.
