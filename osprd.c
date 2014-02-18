@@ -328,10 +328,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 				return -EDEADLK;
 			}
 			
-			/*
-			 TUAN: It is considered invalid to request the same write lock that you already hold
-			 in your current RAM disk.
-			 */
+			// invalid to request the same write lock that you already hold
 			if (pidInList(d->writeLockingPids, current->pid)) {
 				osp_spin_unlock(&(d->mutex));
 				return -EINVAL;
@@ -495,6 +492,8 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 			//block until all conditions are met
 			if (d->writeLockingPids != NULL || d->readLockingPids != NULL) {
 				if (DEBUG) eprintk ("Failed to try acquire write lock\n");
+				grantTicketToNextAliveProcessInOrder(d);
+				wake_up_all(&(d->blockq));
 				return -EBUSY;
 			}
 			
@@ -524,9 +523,8 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 				return -EBUSY;
 			}
 			
-			//also deadlock if I hold a lock in a different file (could be overkill, though!)
-			/*
-			 TUAN: There's only one read lock and one write lock used across different RAM disks.
+			// also deadlock if I hold a lock in a different file (could be overkill, though!)
+			/* only one read lock and one write lock used across different RAM disks.
 			 If the read lock or write lock is used by the current process in other RAM disks,
 			 that would be a deadlock as well => same situation, it waits directly for itself.
 			 */
@@ -537,10 +535,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 				return -EBUSY;
 			}
 			
-			/*
-			 TUAN: It is considered invalid to request the same read lock that you already hold
-			 in your current RAM disk.
-			 */
+			// invalid to request the same read lock that you already hold
 			if (pidInList(d->readLockingPids, current->pid)) {
 				osp_spin_unlock(&(d->mutex));
 				return -EINVAL;
@@ -551,6 +546,8 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 			//block until all conditions are met
 			if (d->writeLockingPids != NULL) {
 				if (DEBUG) eprintk ("Failed to try acquire read lock\n");
+				grantTicketToNextAliveProcessInOrder(d);
+				wake_up_all(&(d->blockq));
 				return -EBUSY;
 			}
 			
@@ -565,7 +562,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 			grantTicketToNextAliveProcessInOrder(d);
 			
 			osp_spin_unlock(&(d->mutex));
-			wake_up_all(&(d->blockq)); //TUAN: wake up all the processes that are waiting for the ticket
+			wake_up_all(&(d->blockq)); // wake up all the processes that are waiting for the ticket
 			//by setting the processes in the run queue to runnable state.
 			return 0;
 		}
