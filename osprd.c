@@ -19,8 +19,7 @@
 
 /* The size of an OSPRD sector. */
 #define SECTOR_SIZE	512
-
-#define DEBUG 1
+#define DEBUG 0
 
 /* This flag is added to an OSPRD file's f_flags to indicate that the file
  * is locked. */
@@ -127,14 +126,14 @@ static void for_each_open_file(struct task_struct *task,
 
 
 // Function declarations
-void addToList(struct pidList** list, pid_t pid);
-void removeFromList(struct pidList** list, pid_t pid);
-int pidInList(struct pidList* list, pid_t pid);
-void addToTicketList(struct ticketList** list, unsigned ticket);
-void removeFromTicketList(struct ticketList** list, unsigned ticket);
-int ticketInList(struct ticketList* list, unsigned ticket);
-void checkLocks(struct file *filp, osprd_info_t *d);
-void grantTicketToNextAliveProcessInOrder(osprd_info_t *d);
+void pidlist_add(struct pidList** list, pid_t pid);
+void pidlist_remove(struct pidList** list, pid_t pid);
+int pid_contains(struct pidList* list, pid_t pid);
+void tixlist_add(struct ticketList** list, unsigned ticket);
+void tixlist_remove(struct ticketList** list, unsigned ticket);
+int tixlist_contains(struct ticketList* list, unsigned ticket);
+void check_locks(struct file *filp, osprd_info_t *d);
+void increment_ticket(osprd_info_t *d);
 
 /*
  * osprd_process_request(d, req)
@@ -202,36 +201,27 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
 		// a lock, release the lock.  Also wake up blocked processes
 		// as appropriate.
 
-		// Your code here.
-
-		// This line avoids compiler warnings; you may remove it.
-		(void) filp_writable, (void) d;
-		
 		if (d == NULL) {
 			return 1;
-			//TUAN Note: return -EINVAL here causes test case 9 to pause
 		}
 		
-		//Below part is identical to the implementation of OSPRDIOCRELEASE
-		
 		osp_spin_lock(&(d->mutex));
-		//TUAN Note: pidInList returns 1 if pid is in the list, 0 otherwise.
 		
-		//TUAN: If the file hasn't locked the ramdisk, return -EINVAL.
-		if (!pidInList(d->writeLockingPids, current->pid) && !(pidInList(d->readLockingPids, current->pid))) {
+		// Invalid if file hasn't locked ramdisk
+		if (!pid_contains(d->writeLockingPids, current->pid) && !(pid_contains(d->readLockingPids, current->pid))) {
 			osp_spin_unlock(&(d->mutex));
 			return -EINVAL;
 		}
 		
-		if (pidInList(d->writeLockingPids, current->pid)) {
-			removeFromList(&d->writeLockingPids, current->pid);
+		if (pid_contains(d->writeLockingPids, current->pid)) {
+			pidlist_remove(&d->writeLockingPids, current->pid);
 		}
 		
-		if (pidInList(d->readLockingPids, current->pid)) {
-			removeFromList(&d->readLockingPids, current->pid);
+		if (pid_contains(d->readLockingPids, current->pid)) {
+			pidlist_remove(&d->readLockingPids, current->pid);
 		}
 		
-		// TUAN: Clear the lock from filp->f_flags if no processes (not just current process) hold any lock.
+		// Clear the lock from filp->f_flags if no processes (not just current process) hold any lock.
 		if (d->readLockingPids == NULL && d->writeLockingPids == NULL) {
 			filp->f_flags &= !F_OSPRD_LOCKED;
 		}
@@ -303,149 +293,78 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// Then, block at least until 'd->ticket_tail == local_ticket'.
 		// (Some of these operations are in a critical section and must
 		// be protected by a spinlock; which ones?)
-		if (filp_writable) {
-			if (DEBUG) eprintk("Attempting to acquire write lock\n");
-			
-			// get a ticket
-			osp_spin_lock(&(d->mutex));
-			ticket = d->ticket_head;
-			d->ticket_head++;
-			
-			// Deadlock - if current proc already has readlock
-			if (pidInList(d->readLockingPids, current->pid)) {
-				osp_spin_unlock(&(d->mutex));
-				return -EDEADLK;
-			}
-			
-			// Deadlock - if current proc holds lock on different file (could be overkill, though!)
-			for_each_open_file(current, checkLocks, d);
-			//if current process also holds a read or write lock in other RAM disks.
-			
-			
-			if (d->holdOtherLocks) {
-				d->holdOtherLocks = 0;
-				osp_spin_unlock(&(d->mutex));
-				return -EDEADLK;
-			}
-			
-			// invalid to request the same write lock that you already hold
-			if (pidInList(d->writeLockingPids, current->pid)) {
-				osp_spin_unlock(&(d->mutex));
-				return -EINVAL;
-			}
-			
-			osp_spin_unlock(&(d->mutex));
-
-			/*
-			 wait_event_interruptible. The first argument is the wait queue. The second argument is the condition to wake up.
-			 The process wakes up when the condition is true or a signal is received.
-			 The function returns 0 if the condition is true. Return -ERESTARTSYS if a signal is received.
-			 */
-			
-			//block until all conditions are met
-			if (wait_event_interruptible(d->blockq, d->ticket_tail==ticket && d->writeLockingPids == NULL && d->readLockingPids == NULL)) {
-				
-				//I encountered a signal, return error condition
-				if (d->ticket_tail == ticket) {
-					if (DEBUG) eprintk ("Granting to next live process\n");
-					grantTicketToNextAliveProcessInOrder(d); //Tuan define this
-				}
-				else  {  //mark my ticket as not usable before process exits
-					if (DEBUG) eprintk ("Adding to exited tickets\n");
-					addToTicketList(&(d->exitedTickets), ticket);
-					//TUAN: this is important because when other process grants the ticket
-					//It makes sure it not grant the ticket to processes that already exited.
-					//It do that by incrementing ticket_tail and make sure ticket_tail not
-					//match the already exited ticket.
-				}
-				if (DEBUG) eprintk ("Returning ERESTARTSYS\n");
-				return -ERESTARTSYS; //TUAN: means your system call is restartable. The process is considered exited/died.
-			}
-			
-			//if I arrive here, I have the ticket to proceed, and no one else holds a read or write lock
-			osp_spin_lock(&(d->mutex));
-			
-			//claim the lock officially
-			filp->f_flags |= F_OSPRD_LOCKED;
-			
-			//keep track of the ID processes that are holding the write lock
-			//Later on, to detect deadlock for the current process, we look up this list
-			//to see if we already have the read or write lock there.
-			addToList(&(d->writeLockingPids), current->pid);
-			
-			//TUAN: find next usable ticket number so that the next in-order alive process can use
-			grantTicketToNextAliveProcessInOrder(d);
-			
-			osp_spin_unlock(&(d->mutex));
-			wake_up_all(&(d->blockq)); //TUAN: wait up all processes in the wait queue d->blockq and evaluate the condition
-			//in wait_event_interruptible for those processes that go to sleep when invoking this function.
-			return 0;
-		} else {
-			if (DEBUG) eprintk("Attempting to acquire read lock\n");
-			
-			//get a ticket
-			osp_spin_lock(&(d->mutex));
-			ticket = d->ticket_head;
-			d->ticket_head++;
-			
-			//Check for deadlock - if I have previous write lock and will have to wait
-			if (pidInList(d->writeLockingPids, current->pid)) {
-				osp_spin_unlock(&(d->mutex));
-				return -EDEADLK;
-			}
-			
-			//also deadlock if I hold a lock in a different file (could be overkill, though!)
-			/*
-			 TUAN: There's only one read lock and one write lock used across different RAM disks.
-			 If the read lock or write lock is used by the current process in other RAM disks,
-			 that would be a deadlock as well => same situation, it waits directly for itself.
-			 */
-			for_each_open_file(current, checkLocks, d);
-			if (d->holdOtherLocks) {
-				d->holdOtherLocks = 0;
-				osp_spin_unlock(&(d->mutex));
-				return -EDEADLK;
-			}
-			
-			/*
-			 TUAN: It is considered invalid to request the same read lock that you already hold
-			 in your current RAM disk.
-			 */
-			if (pidInList(d->readLockingPids, current->pid)) {
-				osp_spin_unlock(&(d->mutex));
-				return -EINVAL;
-			}
-			
-			osp_spin_unlock(&(d->mutex));
-			
-			//block until all conditions are met
-			if (wait_event_interruptible(d->blockq, d->ticket_tail==ticket && d->writeLockingPids == NULL)) {
-				//I encountered a signal, return error condition
-				if (d->ticket_tail == ticket) {
-					grantTicketToNextAliveProcessInOrder(d);
-				}
-				else { //add my ticket to non-usable ticket numbers
-					addToTicketList(&(d->exitedTickets), ticket);
-				}
-				
-				return -ERESTARTSYS;
-			}
-			
-			//if I arrive here, I have the ticket to proceed, and no one else holds a read or write lock
-			osp_spin_lock(&(d->mutex));
-			
-			//claim the lock officially
-			filp->f_flags |= F_OSPRD_LOCKED;
-			addToList(&(d->readLockingPids), current->pid);
-			
-			//TUAN: find next usable ticket number so that the next in-order alive process can use
-			grantTicketToNextAliveProcessInOrder(d);
-			
-			osp_spin_unlock(&(d->mutex));
-			wake_up_all(&(d->blockq)); //TUAN: wake up all the processes that are waiting for the ticket
-			//by setting the processes in the run queue to runnable state.
-			return 0;
+		if (DEBUG) {
+			eprintk("Attempting to acquire lock: ");
+			if (filp_writable)
+				eprintk("write\n");
+			else
+				eprintk("read\n");
 		}
+		
+		
+		/** Ticket + check error cases **/
+		
+		// Get ticket
+		osp_spin_lock(&(d->mutex));
+		ticket = d->ticket_head;
+		d->ticket_head++;
+		
+		// Deadlock - if current proc already has other lock
+		if ((pid_contains(d->readLockingPids, current->pid) && filp_writable) ||
+			(pid_contains(d->writeLockingPids, current->pid) && !filp_writable)) {
+			osp_spin_unlock(&(d->mutex));
+			return -EDEADLK;
+		}
+		
+		// Deadlock - if current proc holds lock on different file (could be overkill, though)
+		for_each_open_file(current, check_locks, d);
+		if (d->holdOtherLocks) {
+			d->holdOtherLocks = 0;
+			osp_spin_unlock(&(d->mutex));
+			return -EDEADLK;
+		}
+		
+		// Invalid - if request the same lock that is already held
+		if ((pid_contains(d->writeLockingPids, current->pid) && filp_writable) ||
+			(pid_contains(d->readLockingPids, current->pid) && !filp_writable)) {
+			osp_spin_unlock(&(d->mutex));
+			return -EINVAL;
+		}
+		
+		osp_spin_unlock(&(d->mutex));
+		
+		/** Blocking **/
+		
+		// first argument is wait queue
+		// second argument is condition to wake
+		if (wait_event_interruptible(d->blockq, d->ticket_tail==ticket &&
+									 d->writeLockingPids == NULL &&
+									 (d->readLockingPids == NULL || !filp_writable))) {
+			
+			if (d->ticket_tail == ticket) {
+				increment_ticket(d);
+			}
+			else  {  // signal received
+				tixlist_add(&(d->exitedTickets), ticket);
+			}
+			return -ERESTARTSYS;
+		}
+		
+		/** Obtain lock **/
+		
+		osp_spin_lock(&(d->mutex));
+		filp->f_flags |= F_OSPRD_LOCKED; // claim lock
+		
+		// keep track of the ID processes that are holding lock
+		if (filp_writable)
+			pidlist_add(&(d->writeLockingPids), current->pid);
+		else
+			pidlist_add(&(d->readLockingPids), current->pid);
+		increment_ticket(d);
+		
+		osp_spin_unlock(&(d->mutex));
+		wake_up_all(&(d->blockq));
+		return 0;
 	} else if (cmd == OSPRDIOCTRYACQUIRE) {
 
 		// EXERCISE: ATTEMPT to lock the ramdisk.
@@ -454,119 +373,65 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// block.  If OSPRDIOCACQUIRE would block or return deadlock,
 		// OSPRDIOCTRYACQUIRE should return -EBUSY.
 		// Otherwise, if we can grant the lock request, return 0.
-
-		// Your code here (instead of the next two lines).
-		if (filp_writable) {
-			if (DEBUG) eprintk("Attempting to tryacquire write lock\n");
-			
-			// get a ticket
-			osp_spin_lock(&(d->mutex));
-			ticket = d->ticket_head;
-			d->ticket_head++;
-			
-			// Deadlock - if current proc already has readlock
-			if (pidInList(d->readLockingPids, current->pid)) {
-				osp_spin_unlock(&(d->mutex));
-				return -EBUSY;
-			}
-			
-			// Deadlock - if current proc holds lock on different file (could be overkill, though!)
-			for_each_open_file(current, checkLocks, d);
-			//if current process also holds a read or write lock in other RAM disks.
-			
-			
-			if (d->holdOtherLocks) {
-				d->holdOtherLocks = 0;
-				osp_spin_unlock(&(d->mutex));
-				return -EBUSY;
-			}
-			
-			// invalid to request the same write lock that you already hold
-			if (pidInList(d->writeLockingPids, current->pid)) {
-				osp_spin_unlock(&(d->mutex));
-				return -EINVAL;
-			}
-			
-			osp_spin_unlock(&(d->mutex));
-			
-			//block until all conditions are met
-			if (d->writeLockingPids != NULL || d->readLockingPids != NULL) {
-				if (DEBUG) eprintk ("Failed to try acquire write lock\n");
-				grantTicketToNextAliveProcessInOrder(d);
-				wake_up_all(&(d->blockq));
-				return -EBUSY;
-			}
-			
-			// Acquire write lock
-			osp_spin_lock(&(d->mutex));
-			filp->f_flags |= F_OSPRD_LOCKED;
-			addToList(&(d->writeLockingPids), current->pid);
-			
-			//TUAN: find next usable ticket number so that the next in-order alive process can use
-			grantTicketToNextAliveProcessInOrder(d);
-			
-			osp_spin_unlock(&(d->mutex));
-			wake_up_all(&(d->blockq)); //TUAN: wait up all processes in the wait queue d->blockq and evaluate the condition
-			//in wait_event_interruptable for those processes that go to sleep when invoking this function.
-			return 0;
-		} else {
-			if (DEBUG) eprintk("Attempting to tryacquire read lock\n");
-			
-			//get a ticket
-			osp_spin_lock(&(d->mutex));
-			ticket = d->ticket_head;
-			d->ticket_head++;
-			
-			//Check for deadlock - if I have previous write lock and will have to wait
-			if (pidInList(d->writeLockingPids, current->pid)) {
-				osp_spin_unlock(&(d->mutex));
-				return -EBUSY;
-			}
-			
-			// also deadlock if I hold a lock in a different file (could be overkill, though!)
-			/* only one read lock and one write lock used across different RAM disks.
-			 If the read lock or write lock is used by the current process in other RAM disks,
-			 that would be a deadlock as well => same situation, it waits directly for itself.
-			 */
-			for_each_open_file(current, checkLocks, d);
-			if (d->holdOtherLocks) {
-				d->holdOtherLocks = 0;
-				osp_spin_unlock(&(d->mutex));
-				return -EBUSY;
-			}
-			
-			// invalid to request the same read lock that you already hold
-			if (pidInList(d->readLockingPids, current->pid)) {
-				osp_spin_unlock(&(d->mutex));
-				return -EINVAL;
-			}
-			
-			osp_spin_unlock(&(d->mutex));
-			
-			//block until all conditions are met
-			if (d->writeLockingPids != NULL) {
-				if (DEBUG) eprintk ("Failed to try acquire read lock\n");
-				grantTicketToNextAliveProcessInOrder(d);
-				wake_up_all(&(d->blockq));
-				return -EBUSY;
-			}
-			
-			// Acquire lock
-			osp_spin_lock(&(d->mutex));
-			
-			//claim the lock officially
-			filp->f_flags |= F_OSPRD_LOCKED;
-			addToList(&(d->readLockingPids), current->pid);
-			
-			//TUAN: find next usable ticket number so that the next in-order alive process can use
-			grantTicketToNextAliveProcessInOrder(d);
-			
-			osp_spin_unlock(&(d->mutex));
-			wake_up_all(&(d->blockq)); // wake up all the processes that are waiting for the ticket
-			//by setting the processes in the run queue to runnable state.
-			return 0;
+		if (DEBUG) {
+			eprintk("Attempting to try acquire lock: ");
+			if (filp_writable)
+				eprintk("write\n");
+			else
+				eprintk("read\n");
 		}
+		
+		/** Ticket + check error cases **/
+		
+		// get ticket
+		osp_spin_lock(&(d->mutex));
+		ticket = d->ticket_head;
+		d->ticket_head++;
+		
+		// Deadlock - if current proc already has complement lock
+		if ((pid_contains(d->readLockingPids, current->pid) && filp_writable) ||
+			(pid_contains(d->writeLockingPids, current->pid) && !filp_writable)) {
+			osp_spin_unlock(&(d->mutex));
+			return -EBUSY;
+		}
+		
+		// Deadlock - if current proc holds lock on different file
+		for_each_open_file(current, check_locks, d);
+		if (d->holdOtherLocks) {
+			d->holdOtherLocks = 0;
+			osp_spin_unlock(&(d->mutex));
+			return -EBUSY;
+		}
+		
+		// invalid to request the same write lock that you already hold
+		if ((pid_contains(d->writeLockingPids, current->pid) && filp_writable) ||
+			(pid_contains(d->readLockingPids, current->pid) && !filp_writable)) {
+			osp_spin_unlock(&(d->mutex));
+			return -EINVAL;
+		}
+		
+		osp_spin_unlock(&(d->mutex));
+		
+		// busy if locks are held
+		if (d->writeLockingPids != NULL || (d->readLockingPids != NULL && filp_writable)) {
+			if (DEBUG) eprintk ("Failed to try acquire lock\n");
+			increment_ticket(d);
+			wake_up_all(&(d->blockq)); // required??
+			return -EBUSY;
+		}
+		
+		// Acquire lock
+		osp_spin_lock(&(d->mutex));
+		filp->f_flags |= F_OSPRD_LOCKED;
+		if (filp_writable)
+			pidlist_add(&(d->writeLockingPids), current->pid);
+		else
+			pidlist_add(&(d->readLockingPids), current->pid);
 
+		increment_ticket(d);
+		osp_spin_unlock(&(d->mutex));
+		wake_up_all(&(d->blockq));
+		return 0;
 	} else if (cmd == OSPRDIOCRELEASE) {
 
 		// EXERCISE: Unlock the ramdisk.
@@ -575,26 +440,24 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// Otherwise, clear the lock from filp->f_flags, wake up
 		// the wait queue, perform any additional accounting steps
 		// you need, and return 0.
-
-		// Your code here (instead of the next line).
 		if (DEBUG) eprintk("Release\n");
 		osp_spin_lock(&(d->mutex));
 		
-		//TUAN: If the file hasn't locked the ramdisk, return -EINVAL.
-		if (!pidInList(d->writeLockingPids, current->pid) && !(pidInList(d->readLockingPids, current->pid))) {
+		// if file hasn't locked the ramdisk, return -EINVAL.
+		if (!pid_contains(d->writeLockingPids, current->pid) && !(pid_contains(d->readLockingPids, current->pid))) {
 			osp_spin_unlock(&(d->mutex));
 			return -EINVAL;
 		}
 		
-		if (pidInList(d->writeLockingPids, current->pid)) {
-			removeFromList(&d->writeLockingPids, current->pid);
+		if (pid_contains(d->writeLockingPids, current->pid)) {
+			pidlist_remove(&d->writeLockingPids, current->pid);
 		}
 		
-		if (pidInList(d->readLockingPids, current->pid)) {
-			removeFromList(&d->readLockingPids, current->pid);
+		if (pid_contains(d->readLockingPids, current->pid)) {
+			pidlist_remove(&d->readLockingPids, current->pid);
 		}
 		
-		// TUAN: Clear the lock from filp->f_flags if no processes (not just current process) hold any lock.
+		// clear the lock from filp->f_flags if no processes (not just current process) hold any lock.
 		if (d->readLockingPids == NULL && d->writeLockingPids == NULL) {
 			filp->f_flags &= !F_OSPRD_LOCKED;
 		}
@@ -623,12 +486,12 @@ static void osprd_setup(osprd_info_t *d)
 }
 
 
-void addToList(struct pidList** list, pid_t pid) {
+void pidlist_add(struct pidList** list, pid_t pid) {
 	
 	struct pidNode* newNode;
 	//check if need to initialize list
 	if (*list == NULL) {
-		//TUAN: kzalloc allocates the kernel memory and zero it before return the pointer.
+		//kzalloc allocates the kernel memory and zero it before return the pointer.
 		//using GFP_ATOMIC to prevent the kernel from block your current memory allocation.
 		//Another commonly used flag is GFP_KERNEL which specifies a normal kernel allocation.
 		//Kernel memory is limited to about 1GB of physical and virtual memory and is not pageable.
@@ -653,7 +516,7 @@ void addToList(struct pidList** list, pid_t pid) {
 //Note: pid can appear many places in the list. This function removes all
 //occurances of pid.
 //works even if pid is not in list
-void removeFromList(struct pidList** list, pid_t pid) {
+void pidlist_remove(struct pidList** list, pid_t pid) {
 	
 	struct pidNode* cur;
 	struct pidNode* toDelete;
@@ -667,14 +530,14 @@ void removeFromList(struct pidList** list, pid_t pid) {
 		return;
 	}
 	
-	//TUAN: if pid matches the head node
+	//if pid matches the head node
 	if (cur->pid == pid) {
 		(*list)->head = cur->next;
-		kfree(cur); //TUAN: kfree frees kernel memory
+		kfree(cur); //kfree frees kernel memory
 		(*list)->size--;
 	}
 	
-	//TUAN: remove other occurances of pid in the list.
+	//remove other occurances of pid in the list.
 	while (cur->next != NULL) {
 		if (cur->next->pid == pid) {
 			toDelete = cur->next;
@@ -693,7 +556,7 @@ void removeFromList(struct pidList** list, pid_t pid) {
 }
 
 //returns 1 if pid is in the list, 0 otherwise
-int pidInList(struct pidList* list, pid_t pid) {
+int pid_contains(struct pidList* list, pid_t pid) {
 	
 	struct pidNode* cur;
 	if (list == NULL) {
@@ -709,7 +572,7 @@ int pidInList(struct pidList* list, pid_t pid) {
 	return 0;
 }
 
-void addToTicketList(struct ticketList** list, unsigned ticket) {
+void tixlist_add(struct ticketList** list, unsigned ticket) {
 	struct ticketNode* newNode;
 	//check if need to initialize list
 	if (*list == NULL) {
@@ -731,7 +594,7 @@ void addToTicketList(struct ticketList** list, unsigned ticket) {
 }
 
 //works even if ticket is not in list
-void removeFromTicketList(struct ticketList** list, unsigned ticket) {
+void tixlist_remove(struct ticketList** list, unsigned ticket) {
 	
 	struct ticketNode* cur;
 	struct ticketNode* toDelete;
@@ -767,7 +630,7 @@ void removeFromTicketList(struct ticketList** list, unsigned ticket) {
 }
 
 
-int ticketInList(struct ticketList* list, unsigned ticket) {
+int tixlist_contains(struct ticketList* list, unsigned ticket) {
 	
 	struct ticketNode* cur;
 	if (list == NULL) {
@@ -783,26 +646,26 @@ int ticketInList(struct ticketList* list, unsigned ticket) {
 	return 0;
 }
 
-void checkLocks(struct file *filp, osprd_info_t *d) {
+void check_locks(struct file *filp, osprd_info_t *d) {
 	osprd_info_t *otherDisk;
 	if ((otherDisk = file2osprd(filp)) != NULL) {
-		if (pidInList(otherDisk->readLockingPids, current->pid) || pidInList(otherDisk->writeLockingPids, current->pid)) {
+		if (pid_contains(otherDisk->readLockingPids, current->pid) || pid_contains(otherDisk->writeLockingPids, current->pid)) {
 			d->holdOtherLocks = 1;
 			return;
 		}
 	}
 }
 
-void grantTicketToNextAliveProcessInOrder(osprd_info_t *d) {
-	while (++(d->ticket_tail)) {//TUAN: without this, program will be paused
+void increment_ticket(osprd_info_t *d) {
+	while (++(d->ticket_tail)) {//without this, program will be paused
 		//if some processes already died and can't handle the ticket.
 		//we make sure only pass the alive ticket to alive processes.
-		if (!ticketInList(d->exitedTickets, d->ticket_tail)) {
-			break; //TUAN: good. The next process is still alive to accept this ticket.
+		if (!tixlist_contains(d->exitedTickets, d->ticket_tail)) {
+			break; //good. The next process is still alive to accept this ticket.
 		}
 		else {
-			//TUAN: no one hanles this ticket.
-			removeFromTicketList(&(d->exitedTickets), d->ticket_tail);
+			//no one hanles this ticket.
+			tixlist_remove(&(d->exitedTickets), d->ticket_tail);
 		}
 	}
 }
