@@ -19,7 +19,7 @@
 
 /* The size of an OSPRD sector. */
 #define SECTOR_SIZE	512
-#define DEBUG 1
+#define DEBUG 0
 
 /* This flag is added to an OSPRD file's f_flags to indicate that the file
  * is locked. */
