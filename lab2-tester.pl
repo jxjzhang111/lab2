@@ -166,6 +166,16 @@ close FOO;
       ') 2>/dev/null',
       "aX"
     ],
+
+    # 19 circular wait
+    [
+      #'echo aaa | ./osprdaccess -w 3 -l /dev/osprda;'.
+      #'echo bbb | ./osprdaccess -w 3 -l /dev/osprdb;'.
+      '(./osprdaccess -r -l 0.2 /dev/osprda | ./osprdaccess -w -d 0.4 -l /dev/osprdb) &'.
+      '(./osprdaccess -r -l 0.2 /dev/osprdb | ./osprdaccess -w -d 0.4 -l /dev/osprda) ;'.
+      './osprdaccess -r -l /dev/osprda',
+      "ioctl"
+    ],
     );
 
 my($ntest) = 0;

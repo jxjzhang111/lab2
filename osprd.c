@@ -19,7 +19,7 @@
 
 /* The size of an OSPRD sector. */
 #define SECTOR_SIZE	512
-#define DEBUG 0
+#define DEBUG 1
 
 /* This flag is added to an OSPRD file's f_flags to indicate that the file
  * is locked. */
@@ -364,6 +364,15 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		
 		osp_spin_unlock(&(d->mutex));
 		wake_up_all(&(d->blockq));
+
+		if (DEBUG) {
+			eprintk("Acquired lock: ");
+			if (filp_writable)
+				eprintk("write\n");
+			else
+				eprintk("read\n");
+		}
+
 		return 0;
 	} else if (cmd == OSPRDIOCTRYACQUIRE) {
 
