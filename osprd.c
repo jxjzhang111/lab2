@@ -312,7 +312,9 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// Deadlock - if current proc already has other lock
 		if ((pid_contains(d->readLockingPids, current->pid) && filp_writable) ||
 			(pid_contains(d->writeLockingPids, current->pid) && !filp_writable)) {
+			increment_ticket(d);
 			osp_spin_unlock(&(d->mutex));
+			wake_up_all(&(d->blockq));
 			return -EDEADLK;
 		}
 		
@@ -320,10 +322,13 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		for_each_open_file(current, check_locks, d);
 		if (d->holdOtherLocks) {
 			d->holdOtherLocks = 0;
+			increment_ticket(d);
 			osp_spin_unlock(&(d->mutex));
+			wake_up_all(&(d->blockq));
 			return -EDEADLK;
 		}
 		
+		// Useless?? Will never go inside the if block
 		// Invalid - if request the same lock that is already held
 		if ((pid_contains(d->writeLockingPids, current->pid) && filp_writable) ||
 			(pid_contains(d->readLockingPids, current->pid) && !filp_writable)) {
@@ -400,7 +405,9 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// Deadlock - if current proc already has complement lock
 		if ((pid_contains(d->readLockingPids, current->pid) && filp_writable) ||
 			(pid_contains(d->writeLockingPids, current->pid) && !filp_writable)) {
+			increment_ticket(d);
 			osp_spin_unlock(&(d->mutex));
+			wake_up_all(&(d->blockq));
 			return -EBUSY;
 		}
 		
@@ -408,14 +415,19 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		for_each_open_file(current, check_locks, d);
 		if (d->holdOtherLocks) {
 			d->holdOtherLocks = 0;
+			increment_ticket(d);
 			osp_spin_unlock(&(d->mutex));
+			wake_up_all(&(d->blockq));
 			return -EBUSY;
 		}
 		
+		// Useless??
 		// invalid to request the same write lock that you already hold
 		if ((pid_contains(d->writeLockingPids, current->pid) && filp_writable) ||
 			(pid_contains(d->readLockingPids, current->pid) && !filp_writable)) {
+			increment_ticket(d);
 			osp_spin_unlock(&(d->mutex));
+			wake_up_all(&(d->blockq));
 			return -EINVAL;
 		}
 		

@@ -173,6 +173,13 @@ close FOO;
       "ioctl OSPRDIOCACQUIRE: Resource deadlock avoided"
     ],
 
+    # 19 deadlock
+    [
+      '(echo foo | ./osprdaccess -w -d 0.3 -l 0.1 /dev/osprdb /dev/osprda) &'.
+      '(echo foo | ./osprdaccess -w -d 0.3 -l 0.1 /dev/osprda /dev/osprdb)',
+      "ioctl OSPRDIOCACQUIRE: Resource deadlock avoided ioctl OSPRDIOCACQUIRE: Resource deadlock avoided"
+    ],
+
     # 19 circular wait
     # [
     #   #'echo aaa | ./osprdaccess -w 3 -l /dev/osprda;'.
